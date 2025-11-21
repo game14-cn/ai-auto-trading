@@ -1,4 +1,4 @@
-# NexusQuant | 灵枢量化
+# ArgoQuant
 
 > 📖 **Complete Documentation** | This is the full English documentation. For a quick overview, see the [main README](./README.md).
 >
@@ -8,14 +8,6 @@
 
 <div align="center">
 
-[![VoltAgent](https://img.shields.io/badge/Framework-VoltAgent-purple.svg)](https://voltagent.dev)
-[![OpenAI Compatible](https://img.shields.io/badge/AI-OpenAI_Compatible-orange.svg)](https://openrouter.ai)
-[![Gate.io](https://img.shields.io/badge/Exchange-Gate.io-00D4AA.svg)](https://www.gatesite.org/signup/VQBEAwgL?ref_type=103)
-[![Binance](https://img.shields.io/badge/Exchange-Binance-F0B90B.svg)](https://www.maxweb.red/referral/earn-together/refer2earn-usdc/claim?hl=zh-CN&ref=GRO_28502_NCRQJ&utm_source=default)
-[![TypeScript](https://img.shields.io/badge/Language-TypeScript-3178C6.svg?logo=typescript&logoColor=white)](https://www.typescriptlang.org)
-[![Node.js](https://img.shields.io/badge/Runtime-Node.js%2020+-339933.svg?logo=node.js&logoColor=white)](https://nodejs.org)
-[![License](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](./LICENSE)
-
 | [English](./README_EN.md) | [简体中文](./README_ZH.md) | [日本語](./README_JA.md) |
 |:---:|:---:|:---:|
 
@@ -23,7 +15,7 @@
 
 ## Overview
 
-**NexusQuant (灵枢量化)** is a next-generation AI-driven cryptocurrency automated trading system that fundamentally reimagines quantitative trading through deep integration of large language models with institutional-grade trading practices. Unlike traditional algorithmic systems with hard-coded strategies, this system achieves **true intelligent autonomy** by leveraging AI's reasoning capabilities for real-time market analysis and adaptive decision-making.
+**ArgoQuant** is a next-generation AI-driven cryptocurrency automated trading system that fundamentally reimagines quantitative trading through deep integration of large language models with institutional-grade trading practices. Unlike traditional algorithmic systems with hard-coded strategies, this system achieves **true intelligent autonomy** by leveraging AI's reasoning capabilities for real-time market analysis and adaptive decision-making.
 
 ### 🎯 Core Philosophy
 

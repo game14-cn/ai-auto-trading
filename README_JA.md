@@ -1,4 +1,4 @@
-# NexusQuant | 灵枢量化（リンスウリョウカ）
+# ArgoQuant（リンスウリョウカ）
 
 > 📖 **完全なドキュメント** | これは完全な日本語ドキュメントです。クイックスタートについては、[メインREADME](./README.md)をご覧ください。
 >
@@ -8,14 +8,6 @@
 
 <div align="center">
 
-[![VoltAgent](https://img.shields.io/badge/Framework-VoltAgent-purple.svg)](https://voltagent.dev)
-[![OpenAI Compatible](https://img.shields.io/badge/AI-OpenAI_Compatible-orange.svg)](https://openrouter.ai)
-[![Gate.io](https://img.shields.io/badge/Exchange-Gate.io-00D4AA.svg)](https://www.gatesite.org/signup/VQBEAwgL?ref_type=103)
-[![Binance](https://img.shields.io/badge/Exchange-Binance-F0B90B.svg)](https://www.maxweb.red/referral/earn-together/refer2earn-usdc/claim?hl=zh-CN&ref=GRO_28502_NCRQJ&utm_source=default)
-[![TypeScript](https://img.shields.io/badge/Language-TypeScript-3178C6.svg?logo=typescript&logoColor=white)](https://www.typescriptlang.org)
-[![Node.js](https://img.shields.io/badge/Runtime-Node.js%2020+-339933.svg?logo=node.js&logoColor=white)](https://nodejs.org)
-[![License](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](./LICENSE)
-
 | [English](./README_EN.md) | [简体中文](./README_ZH.md) | [日本語](./README_JA.md) |
 |:---:|:---:|:---:|
 
@@ -23,7 +15,7 @@
 
 ## システム概要
 
-**NexusQuant（灵枢量化 / リンスウリョウカ）** は、大規模言語モデルと機関レベルの取引実践を深く統合することで量的取引を根本的に再定義する、次世代 AI 駆動の暗号通貨自動取引システムです。ハードコードされた戦略を持つ従来のアルゴリズムシステムとは異なり、本システムはAIの推論能力を活用してリアルタイムの市場分析と適応的な意思決定を行う**真の知的自律性**を実現します。
+**ArgoQuant** は、大規模言語モデルと機関レベルの取引実践を深く統合することで量的取引を根本的に再定義する、次世代 AI 駆動の暗号通貨自動取引システムです。ハードコードされた戦略を持つ従来のアルゴリズムシステムとは異なり、本システムはAIの推論能力を活用してリアルタイムの市場分析と適応的な意思決定を行う**真の知的自律性**を実現します。
 
 ### 🎯 コア哲学
 
@@ -1167,9 +1159,3 @@ Conventional Commits 規約に従います:
 - `chore`: ビルドプロセスまたは補助ツールの変更
 - `ci`: CI/CD 設定の変更
 
----
-<div align="center">
-
-[![Star History Chart](https://api.star-history.com/svg?repos=losesky/ai-auto-trading&type=Date)](https://star-history.com/#losesky/ai-auto-trading&Date)
-
-</div>

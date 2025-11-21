@@ -1,4 +1,4 @@
-# 灵枢量化 | NexusQuant
+# Argo — AI Quant Orchestrator
 
 > 📖 **完整文档** | 这是完整的中文文档。如需快速了解，请查看[主说明文件](./README.md)。
 >
@@ -8,14 +8,6 @@
 
 <div align="center">
 
-[![VoltAgent](https://img.shields.io/badge/Framework-VoltAgent-purple.svg)](https://voltagent.dev)
-[![OpenAI Compatible](https://img.shields.io/badge/AI-OpenAI_Compatible-orange.svg)](https://openrouter.ai)
-[![Gate.io](https://img.shields.io/badge/Exchange-Gate.io-00D4AA.svg)](https://www.gatesite.org/signup/VQBEAwgL?ref_type=103)
-[![Binance](https://img.shields.io/badge/Exchange-Binance-F0B90B.svg)](https://www.maxweb.red/referral/earn-together/refer2earn-usdc/claim?hl=zh-CN&ref=GRO_28502_NCRQJ&utm_source=default)
-[![TypeScript](https://img.shields.io/badge/Language-TypeScript-3178C6.svg?logo=typescript&logoColor=white)](https://www.typescriptlang.org)
-[![Node.js](https://img.shields.io/badge/Runtime-Node.js%2020+-339933.svg?logo=node.js&logoColor=white)](https://nodejs.org)
-[![License](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](./LICENSE)
-
 | [English](./README_EN.md) | [简体中文](./README_ZH.md) | [日本語](./README_JA.md) |
 |:---:|:---:|:---:|
 
@@ -23,7 +15,7 @@
 
 ## 系统概述
 
-**灵枢量化（NexusQuant）** 是新一代 AI 驱动的加密货币自动交易系统，通过深度融合大语言模型与机构级交易实践，从根本上重新定义了量化交易。与传统的硬编码算法系统不同，本系统通过利用 AI 的推理能力实现**真正的智能自主性**，进行实时市场分析和自适应决策。
+**ArgoQuant** 是新一代 AI 驱动的加密货币自动交易系统，通过深度融合大语言模型与机构级交易实践，从根本上重新定义了量化交易。与传统的硬编码算法系统不同，本系统通过利用 AI 的推理能力实现**真正的智能自主性**，进行实时市场分析和自适应决策。
 
 ### 🎯 核心理念
 
@@ -1224,9 +1216,4 @@ npm run trading:start
 - `chore`: 构建过程或辅助工具变更
 - `ci`: CI/CD 配置变更
 
----
-<div align="center">
 
-[![Star History Chart](https://api.star-history.com/svg?repos=losesky/ai-auto-trading&type=Date)](https://star-history.com/#losesky/ai-auto-trading&Date)
-
-</div>

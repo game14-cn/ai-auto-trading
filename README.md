@@ -1,18 +1,10 @@
-# 灵枢量化 | NexusQuant
+# Argo — AI Quant Orchestrator
 
-> **AI 驱动的多策略、多时间框架加密货币交易监控系统**
+> **专注加密货币的多策略、多时间框架量化交易。**
 > 
-> **Cryptocurrency Trading Monitor - AI-Driven Multi-Strategy, Multi-Timeframe System**
+> **Multi-strategy, multi-timeframe quant trading focused on crypto.**
 
 <div align="center">
-
-[![VoltAgent](https://img.shields.io/badge/Framework-VoltAgent-purple.svg)](https://voltagent.dev)
-[![OpenAI Compatible](https://img.shields.io/badge/AI-OpenAI_Compatible-orange.svg)](https://openrouter.ai)
-[![Gate.io](https://img.shields.io/badge/Exchange-Gate.io-00D4AA.svg)](https://www.gatesite.org/signup/VQBEAwgL?ref_type=103)
-[![Binance](https://img.shields.io/badge/Exchange-Binance-F0B90B.svg)](https://www.maxweb.red/referral/earn-together/refer2earn-usdc/claim?hl=zh-CN&ref=GRO_28502_NCRQJ&utm_source=default)
-[![TypeScript](https://img.shields.io/badge/Language-TypeScript-3178C6.svg?logo=typescript&logoColor=white)](https://www.typescriptlang.org)
-[![Node.js](https://img.shields.io/badge/Runtime-Node.js%2020+-339933.svg?logo=node.js&logoColor=white)](https://nodejs.org)
-[![License](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](./LICENSE)
 
 | [English](./README_EN.md) | [简体中文](./README_ZH.md) | [日本語](./README_JA.md) |
 |:---:|:---:|:---:|
@@ -21,7 +13,7 @@
 
 ## 系统概述
 
-**灵枢量化（NexusQuant）** 是新一代 AI 驱动的加密货币自动交易系统，通过深度融合大语言模型与机构级交易实践，从根本上重新定义了量化交易。
+**ArgoQuant** 是新一代 AI 驱动的加密货币自动交易系统，通过深度融合大语言模型与机构级交易实践，从根本上重新定义了量化交易。
 
 ### 🎯 核心理念
 
@@ -381,24 +373,6 @@ npm run trading:start
 
 ## 资源
 
-### 节省交易成本 & 支持项目
-
-✅ 获得交易手续费返佣
-✅ 支持开源项目持续开发
-✅ 完全免费，无额外费用
-
-**如果您还没有 Gate.io 账户，推荐通过邀请码注册：**
-
-- **邀请链接**：<https://www.gatesite.org/signup/VQBEAwgL?ref_type=103>
-- **邀请码**：`VQBEAwgL`
-
-**如果您还没有 Binance 账户，推荐通过邀请码注册：**
-
-- **邀请链接**：<https://www.maxweb.red/referral/earn-together/refer2earn-usdc/claim?hl=zh-CN&ref=GRO_28502_NCRQJ&utm_source=default>
-- **邀请码**：`GRO_28502_NCRQJ`
-
-> **提示**：测试网和正式网使用同一账户，建议先在测试网充分测试。使用邀请码注册，您将获得交易返佣优惠，同时帮助维护这个开源项目的长期运营。这对您和项目都有益，且完全免费无任何额外费用。
-
 ### 相关链接
 
 - [VoltAgent 文档](https://voltagent.dev/docs/)
@@ -406,14 +380,6 @@ npm run trading:start
 - [Gate.io API 文档](https://www.gate.io/docs/developers/apiv4/)
 - [Gate.io 测试网](https://www.gate.io/testnet)
 
-## 参与贡献
+### 感谢
+- 本项目从[losesky/ai-auto-trading](https://github.com/losesky/ai-auto-trading)构建
 
-欢迎贡献！请参考[完整文档](./README_ZH.md#参与贡献)了解贡献指南。
-
----
-
-<div align="center">
-
-[![Star History Chart](https://api.star-history.com/svg?repos=losesky/ai-auto-trading&type=Date)](https://star-history.com/#losesky/ai-auto-trading&Date)
-
-</div>

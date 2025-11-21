@@ -117,13 +117,13 @@ echo -e "${YELLOW}配置远程仓库...${NC}"
 # 配置个人仓库 (origin)
 if ! git remote | grep -q "^origin$"; then
     echo -e "${YELLOW}添加个人仓库(origin)...${NC}"
-    git remote add origin https://github.com/losesky/ai-auto-trading.git
+    git remote add origin https://github.com/game14-cn/ai-auto-trading.git
     echo -e "${GREEN}个人仓库已添加${NC}"
 else
     current_origin=$(git remote get-url origin 2>/dev/null)
-    if [ "$current_origin" != "https://github.com/losesky/ai-auto-trading.git" ]; then
+    if [ "$current_origin" != "https://github.com/game14-cn/ai-auto-trading.git" ]; then
         echo -e "${YELLOW}更新个人仓库URL...${NC}"
-        git remote set-url origin https://github.com/losesky/ai-auto-trading.git
+        git remote set-url origin https://github.com/game14-cn/ai-auto-trading.git
         echo -e "${GREEN}个人仓库URL已更新${NC}"
     else
         echo -e "${GREEN}个人仓库(origin)已正确设置${NC}"

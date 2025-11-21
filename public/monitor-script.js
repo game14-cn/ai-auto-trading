@@ -55,22 +55,22 @@ class TradingMonitor {
 
     // 加载 GitHub 星标数
     async loadGitHubStars() {
-        try {
-            const response = await fetch('https://api.github.com/repos/losesky/ai-auto-trading');
-            const data = await response.json();
-            const starsCount = document.getElementById('stars-count');
-            if (starsCount && data.stargazers_count !== undefined) {
-                // 格式化星标数（超过1000显示 k）
-                const count = data.stargazers_count;
-                starsCount.textContent = count >= 1000 ? `${(count / 1000).toFixed(1)}k` : count;
-            }
-        } catch (error) {
-            console.error('加载 GitHub 星标数失败:', error);
-            const starsCount = document.getElementById('stars-count');
-            if (starsCount) {
-                starsCount.textContent = '-';
-            }
-        }
+        // try {
+        //     const response = await fetch('https://api.github.com/repos/losesky/ai-auto-trading');
+        //     const data = await response.json();
+        //     const starsCount = document.getElementById('stars-count');
+        //     if (starsCount && data.stargazers_count !== undefined) {
+        //         // 格式化星标数（超过1000显示 k）
+        //         const count = data.stargazers_count;
+        //         starsCount.textContent = count >= 1000 ? `${(count / 1000).toFixed(1)}k` : count;
+        //     }
+        // } catch (error) {
+        //     console.error('加载 GitHub 星标数失败:', error);
+        //     const starsCount = document.getElementById('stars-count');
+        //     if (starsCount) {
+        //         starsCount.textContent = '-';
+        //     }
+        // }
     }
 
     // 加载账户数据
