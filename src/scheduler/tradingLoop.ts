@@ -24,6 +24,7 @@ import { parsePositionSize } from "../utils";
 import { createLogger } from "../utils/logger";
 import { createClient } from "@libsql/client";
 import { createTradingAgent, generateTradingPrompt, getAccountRiskConfig, getTradingStrategy, getStrategyParams } from "../agents/tradingAgent";
+import { generateCompactPrompt } from "../agents/compactPrompt";
 import { getExchangeClient } from "../exchanges";
 import { getChinaTimeISO } from "../utils/timeUtils";
 import { RISK_PARAMS } from "../config/riskParams";
@@ -900,13 +901,14 @@ async function getPositions(cachedExchangePositions?: any[]) {
     // 如果提供了缓存数据，使用缓存；否则重新获取
     const exchangePositions = cachedExchangePositions || await exchangeClient.getPositions();
     
-    // 从数据库获取持仓的开仓时间、entry_order_id 和 metadata（包含反转预警信息）
-    const dbResult = await dbClient.execute("SELECT symbol, opened_at, entry_order_id, metadata FROM positions");
+    // 从数据库获取持仓的开仓时间、entry_order_id、metadata（反转预警）和 partial_close_percentage（分批止盈进度）
+    const dbResult = await dbClient.execute("SELECT symbol, opened_at, entry_order_id, metadata, partial_close_percentage FROM positions");
     const dbDataMap = new Map(
       dbResult.rows.map((row: any) => [row.symbol, { 
         opened_at: row.opened_at, 
         entry_order_id: row.entry_order_id,
-        metadata: row.metadata ? (typeof row.metadata === 'string' ? JSON.parse(row.metadata) : row.metadata) : null
+        metadata: row.metadata ? (typeof row.metadata === 'string' ? JSON.parse(row.metadata) : row.metadata) : null,
+        partial_close_percentage: Number.parseFloat(row.partial_close_percentage as string || "0")
       }])
     );
     
@@ -953,6 +955,7 @@ async function getPositions(cachedExchangePositions?: any[]) {
           opened_at: openedAt,
           entry_order_id: dbData?.entry_order_id, // 包含开仓订单ID用于识别当前活跃持仓
           metadata: dbData?.metadata || null, // 包含反转预警等元数据
+          partial_close_percentage: dbData?.partial_close_percentage || 0, // 🔧 包含分批止盈进度
         };
       });
     
@@ -1613,17 +1616,29 @@ async function executeTradingDecision() {
     }
     
     // 9. 生成提示词并调用 Agent
-    const prompt = await generateTradingPrompt({
-      minutesElapsed,
-      iteration: iterationCount,
-      intervalMinutes,
-      marketData,
-      accountInfo,
-      positions,
-      tradeHistory,
-      recentDecisions,
-      closeEvents,
-    });
+    // 优化: 使用精简版提示词减少tokens消耗(约70%),降低API费用
+    const useCompactPrompt = process.env.USE_COMPACT_PROMPT !== 'false'; // 默认启用精简模式
+    
+    const prompt = useCompactPrompt 
+      ? await generateCompactPrompt({
+          minutesElapsed,
+          iteration: iterationCount,
+          intervalMinutes,
+          marketData,
+          accountInfo,
+          positions,
+        })
+      : await generateTradingPrompt({
+          minutesElapsed,
+          iteration: iterationCount,
+          intervalMinutes,
+          marketData,
+          accountInfo,
+          positions,
+          tradeHistory,
+          recentDecisions,
+          closeEvents,
+        });
     
     // 输出完整提示词到日志
     logger.info("【入参 - AI 提示词】");
@@ -1634,10 +1649,12 @@ async function executeTradingDecision() {
     const agent = createTradingAgent(intervalMinutes);
     
     try {
-      // 设置足够大的 maxOutputTokens 以避免输出被截断
-      // DeepSeek API 限制: max_tokens 范围为 [1, 8192]
+      // 优化: 根据提示词模式调整maxOutputTokens
+      // 精简模式下AI响应也应该更简洁,减少输出tokens
+      const maxOutputTokens = useCompactPrompt ? 4096 : 8192;
+      
       const response = await agent.generateText(prompt, {
-        maxOutputTokens: 8192,
+        maxOutputTokens,
         maxSteps: 20,
         temperature: 0.4,
       });

@@ -29,6 +29,7 @@ import { RISK_PARAMS } from "../config/riskParams";
 import { formatPrice, formatUSDT, formatPercent, formatATR, getDecimalPlacesBySymbol } from "../utils/priceFormatter";
 import { analyzeMultipleMarketStates } from "../services/marketStateAnalyzer";
 import type { MarketStateAnalysis } from "../types/marketState";
+import { generateCompactInstructions } from "./compactInstructions";
 
 /**
  * 账户风险配置
@@ -650,21 +651,9 @@ export async function generateTradingPrompt(data: {
   // 获取最小开仓机会评分阈值
   const minOpportunityScore = getMinOpportunityScore();
   
-  let prompt = `【交易周期 #${iteration}】${currentTime}
-已运行 ${minutesElapsed} 分钟，执行周期 ${intervalMinutes} 分钟
+  let prompt = `【周期 #${iteration}】${currentTime} | 策略:${params.name} | 运行${minutesElapsed}分钟
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-当前策略：${params.name}（${params.description}）
-目标月回报：${params.name === '稳健' ? '10-20%' : params.name === '平衡' ? '20-40%' : '40%+'}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-【硬性风控底线 - 系统强制执行】
-┌─────────────────────────────────────────┐
-│ 科学止损保护：交易所服务器端24/7监控    │
-│   • 触及止损位立即平仓（不受程序限制）  │
-│   • 如超过止损阈值未平仓：系统强制介入  │
-│ 持仓时间 ≥ 36小时：强制平仓             │
-└─────────────────────────────────────────┘
+【风控底线】科学止损24/7监控,持仓≥36h强制平仓
 
 【AI战术决策 - 强烈建议遵守】
 ┌────────────────────────────────────────────────────────────────┐
@@ -863,7 +852,7 @@ ${params.scientificStopLoss?.enabled ? `│ 移动止损优化（可选，低优
    
    ❌ 错误案例：
    1. 直接调用 openPosition('XRP', ...) → 跳过了评估流程 ❌
-   2. 调用 analyze_opening_opportunities() → 全部 < 60分 → 强行开仓 ❌
+   2. 调用 analyze_opening_opportunities() → 全部 < ${Math.floor(minOpportunityScore)}分 → 强行开仓 ❌
    3. 调用 analyze_opening_opportunities() → XRP 67分 → 自主选择开 BTC ❌}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1195,6 +1184,17 @@ ${params.scientificStopLoss?.enabled ? `│ 移动止损优化（可选，低优
       prompt += `  杠杆倍数: ${pos.leverage}x\n`;
       prompt += `  盈亏百分比: ${pnlPercent >= 0 ? '+' : ''}${formatPercent(pnlPercent)}% (已考虑杠杆倍数)\n`;
       prompt += `  盈亏金额: ${pos.unrealized_pnl >= 0 ? '+' : ''}${formatUSDT(pos.unrealized_pnl)} USDT\n`;
+      
+      // 🔧 关键修复: 显示分批止盈进度
+      const partialClosed = pos.partial_close_percentage || 0;
+      if (partialClosed > 0) {
+        let stageInfo = '';
+        if (partialClosed >= 66) stageInfo = 'Stage 3 (已平66%)';
+        else if (partialClosed >= 33) stageInfo = 'Stage 2 (已平33%)';
+        else stageInfo = 'Stage 1 (已平部分)';
+        prompt += `  分批止盈进度: ${stageInfo}\n`;
+      }
+      
       prompt += `  开仓价: ${formatPrice(pos.entry_price)}\n`;
       prompt += `  当前价: ${formatPrice(pos.current_price)}\n`;
       prompt += `  开仓时间: ${formatChinaTime(pos.opened_at)}\n`;
@@ -2358,10 +2358,21 @@ export function createTradingAgent(intervalMinutes: number = 5) {
   // 获取当前策略
   const strategy = getTradingStrategy();
   logger.info(`使用交易策略: ${strategy}`);
+  
+  // 根据环境变量决定使用精简版还是完整版指令
+  const useCompactInstructions = process.env.USE_COMPACT_PROMPT !== 'false';
+  const params = getStrategyParams(strategy);
+  const minOpportunityScore = getMinOpportunityScore();
+  
+  const instructions = useCompactInstructions
+    ? generateCompactInstructions(strategy, params, intervalMinutes, minOpportunityScore)
+    : generateInstructions(strategy, intervalMinutes);
+  
+  logger.info(`使用${useCompactInstructions ? '精简版' : '完整版'}Agent指令`);
 
   const agent = new Agent({
     name: "trading-agent",
-    instructions: generateInstructions(strategy, intervalMinutes),
+    instructions,
     model: openai.chat(process.env.AI_MODEL_NAME || "deepseek/deepseek-v3.2-exp"),
     tools: [
       tradingTools.getMarketPriceTool,
