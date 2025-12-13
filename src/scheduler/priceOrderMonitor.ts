@@ -28,6 +28,7 @@ import { createLogger } from "../utils/logger";
 import { getChinaTimeISO } from "../utils/timeUtils";
 import { getQuantoMultiplier } from "../utils/contractUtils";
 import { FeeService } from "../services/feeService";
+import { extractOrderId, createOrderIdMap } from "../utils/orderIdExtractor";
 import type { Client } from "@libsql/client";
 import type { IExchangeClient } from "../exchanges/IExchangeClient";
 
@@ -132,28 +133,41 @@ export class PriceOrderMonitor {
         return;
       }
 
-      logger.debug(`🔍 检测 ${activeOrders.length} 个活跃条件单...`);
+      // 🔧 过滤掉刚创建的条件单（30秒保护窗口）
+      // 原因：币安测试网API响应慢，刚创建的条件单可能1-2分钟内查不到，避免误判为"消失"
+      const now = Date.now();
+      const GRACE_PERIOD_MS = 30 * 1000; // 30秒保护窗口（币安测试网需要更长时间）
+      const ordersToCheck = activeOrders.filter(order => {
+        const createdAt = new Date(order.created_at).getTime();
+        const age = now - createdAt;
+        if (age < GRACE_PERIOD_MS) {
+          logger.debug(`⏳ 跳过刚创建的条件单: ${order.symbol} ${order.type} (创建时间: ${Math.floor(age/1000)}秒前)`);
+          return false;
+        }
+        return true;
+      });
+
+      if (ordersToCheck.length === 0) {
+        logger.debug('✅ 所有活跃条件单都在保护窗口内，无需检测');
+        return;
+      }
+
+      logger.debug(`🔍 检测 ${ordersToCheck.length}/${activeOrders.length} 个活跃条件单（已过滤刚创建的）...`);
 
       // 2. 获取交易所的条件单
       let exchangeOrders: any[] = [];
       try {
         exchangeOrders = await this.exchangeClient.getPriceOrders();
+        logger.debug(`📋 交易所返回 ${exchangeOrders.length} 个条件单`);
       } catch (error: any) {
         logger.warn('⚠️ 无法从交易所获取条件单列表，跳过本次检测（可能是API错误）:', error.message);
         return;
       }
       
-      // 构建交易所订单映射表，统一使用 id 字段作为 key
-      // Gate.io API返回的对象格式: { id: number, ... }
-      // Binance API返回的对象格式可能不同，需要兼容
-      const exchangeOrderMap = new Map<string, any>(
-        exchangeOrders
-          .map(o => {
-            const orderId = (o.id || o.orderId || o.order_id)?.toString();
-            return [orderId, o] as [string, any];
-          })
-          .filter(([id]) => id) // 过滤掉没有ID的订单
-      );
+      // 构建交易所订单映射表，使用统一的订单ID提取工具
+      const exchangeOrderMap = createOrderIdMap(exchangeOrders);
+      
+      logger.debug(`🔑 交易所订单ID映射: [${Array.from(exchangeOrderMap.keys()).join(', ')}]`);
 
       // 3. 同时获取交易所实际持仓状态（关键补充）
       let exchangePositions: any[] = [];
@@ -173,15 +187,17 @@ export class PriceOrderMonitor {
       // 4. 识别已触发的条件单
       // 🔧 核心优化：记录初始条件单状态，用于检测状态变化
       const initialOrderStates = new Map<string, boolean>(
-        activeOrders.map(order => [order.order_id, exchangeOrderMap.has(order.order_id)])
+        ordersToCheck.map(order => [order.order_id, exchangeOrderMap.has(order.order_id)])
       );
       
-      for (const dbOrder of activeOrders) {
+      for (const dbOrder of ordersToCheck) {
         try {
           const contract = this.exchangeClient.normalizeContract(dbOrder.symbol);
           let orderInExchange = exchangeOrderMap.has(dbOrder.order_id);
           const positionInExchange = exchangePositionMap.has(contract);
           const initialOrderState = initialOrderStates.get(dbOrder.order_id) || false;
+          
+          logger.debug(`🔍 检查条件单: ${dbOrder.symbol} ${dbOrder.type} ID=${dbOrder.order_id}, 在交易所=${orderInExchange}, 持仓存在=${positionInExchange}`);
           
           // 🔧 智能修复：如果数据库中的条件单ID在交易所不存在，
           // 但交易所有该合约的条件单，尝试同步更新数据库ID
@@ -212,7 +228,8 @@ export class PriceOrderMonitor {
             });
             
             if (matchingOrder) {
-              const newOrderId = (matchingOrder.id || matchingOrder.orderId || matchingOrder.order_id)?.toString();
+              // 使用统一的订单ID提取工具
+              const newOrderId = extractOrderId(matchingOrder);
               if (newOrderId && newOrderId !== dbOrder.order_id) {
                 logger.info(`🔄 检测到条件单ID不匹配，自动同步: ${dbOrder.order_id} → ${newOrderId}`);
                 
@@ -267,8 +284,9 @@ export class PriceOrderMonitor {
                 logger.info(`🔍 ${dbOrder.symbol} ${detectionReason}: ${dbOrder.order_id}`);
               } else {
                 // 没有成交记录 - 检查价格是否穿越触发线
+                // 🔧 条件单监控使用实时价格（跳过缓存）以获得最新触发状态
                 try {
-                  const currentTicker = await this.exchangeClient.getFuturesTicker(contract);
+                  const currentTicker = await this.exchangeClient.getFuturesTicker(contract, 2, { skipCache: true });
                   const currentPrice = parseFloat(currentTicker.last || '0');
                   const triggerPrice = parseFloat(dbOrder.trigger_price);
                   
@@ -1328,18 +1346,20 @@ export class PriceOrderMonitor {
       
       logger.info(`📋 [自动修复] 持仓信息: 数量=${quantity}, 止损价=${stopLossPrice}`);
       
-      // 调用交易所API创建新的止损条件单
+      // 调用交易所API创建新的止损条件单（使用 setPositionStopLoss 统一接口）
       const contract = this.exchangeClient.normalizeContract(order.symbol);
-      const newStopLossOrder = await this.exchangeClient.createFuturesPriceOrder({
+      const result = await this.exchangeClient.setPositionStopLoss(
         contract,
-        size: order.side === 'long' ? quantity : -quantity,
-        price: 0, // 市价平仓
-        triggerPrice: stopLossPrice,
-        reduceOnly: true,
-        type: 'stop_loss'
-      });
+        stopLossPrice,
+        undefined // 不重建止盈单
+      );
       
-      logger.info(`✅ [自动修复] 新止损单已在交易所创建: ID=${newStopLossOrder.id}`);
+      if (!result.success) {
+        throw new Error(result.message || '创建止损单失败');
+      }
+      
+      const newStopLossOrderId = result.stopLossOrderId;
+      logger.info(`✅ [自动修复] 新止损单已在交易所创建: ID=${newStopLossOrderId}`);
       
       // 更新数据库：旧止损单标记为cancelled，新止损单插入
       await this.dbClient.execute('BEGIN TRANSACTION');
@@ -1354,7 +1374,7 @@ export class PriceOrderMonitor {
                  status, position_order_id, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           args: [
-            newStopLossOrder.id?.toString() || `recreated-${Date.now()}`,
+            newStopLossOrderId || `recreated-${Date.now()}`,
             order.symbol,
             order.side,
             'stop_loss',
@@ -1368,7 +1388,7 @@ export class PriceOrderMonitor {
         });
         
         await this.dbClient.execute('COMMIT');
-        logger.info(`✅ [自动修复成功] 数据库已更新：旧止损单cancelled，新止损单active (${newStopLossOrder.id})`);
+        logger.info(`✅ [自动修复成功] 数据库已更新：旧止损单cancelled，新止损单active (${newStopLossOrderId})`);
         
       } catch (dbError: any) {
         await this.dbClient.execute('ROLLBACK');

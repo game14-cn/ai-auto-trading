@@ -32,12 +32,20 @@ export interface ExchangeConfig {
 }
 
 /**
+ * 缓存选项
+ */
+export interface CacheOptions {
+  ttl?: number;        // 缓存时间（毫秒），如果设置则覆盖默认TTL
+  skipCache?: boolean; // 是否跳过缓存直接查询交易所
+}
+
+/**
  * Ticker 价格信息
  */
 export interface TickerInfo {
   contract: string;
   last: string;
-  markPrice: string;
+  markPrice?: string;  // 标记价格（可选，需要时才查询以减少API调用）
   indexPrice?: string;
   volume24h?: string;
   high24h?: string;
@@ -159,8 +167,10 @@ export interface IExchangeClient {
    * 获取合约ticker价格
    * @param contract 合约名称（如 BTC_USDT 或 BTCUSDT）
    * @param retries 重试次数
+   * @param cacheOptions 缓存选项（可选）
+   * @param includeMarkPrice 是否包含标记价格（默认false以减少API调用）
    */
-  getFuturesTicker(contract: string, retries?: number): Promise<TickerInfo>;
+  getFuturesTicker(contract: string, retries?: number, cacheOptions?: CacheOptions, includeMarkPrice?: boolean): Promise<TickerInfo>;
 
   /**
    * 获取合约K线数据
@@ -168,12 +178,14 @@ export interface IExchangeClient {
    * @param interval 时间间隔（如 5m, 15m, 1h, 4h）
    * @param limit 数据条数
    * @param retries 重试次数
+   * @param cacheOptions 缓存选项（可选）
    */
   getFuturesCandles(
     contract: string,
     interval: string,
     limit: number,
-    retries?: number
+    retries?: number,
+    cacheOptions?: CacheOptions
   ): Promise<CandleData[]>;
 
   /**
@@ -379,9 +391,19 @@ export interface IExchangeClient {
 
   /**
    * 获取条件单列表
-   * @param contract 合约名称（可选）
+   * @param contract 合约名称(可选)
    * @param status 状态过滤（可选）：'open'=活跃, 'finished'=已触发
    * @returns 条件单列表
    */
   getPriceOrders(contract?: string, status?: string): Promise<any[]>;
+
+  /**
+   * 获取熔断器状态（检测是否因IP封禁或其他原因使用缓存数据）
+   * @returns 熔断器信息
+   */
+  getCircuitBreakerStatus(): {
+    isOpen: boolean;        // 熔断器是否打开（true=使用缓存，false=正常连接）
+    reason?: string;        // 熔断原因（如 'IP封禁', 'API限流'）
+    remainingSeconds?: number; // 剩余时间（秒）
+  };
 }

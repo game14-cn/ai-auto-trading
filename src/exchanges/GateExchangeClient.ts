@@ -23,6 +23,7 @@
 import * as GateApi from "gate-api";
 import { createLogger } from "../utils/logger";
 import { RISK_PARAMS } from "../config/riskParams";
+import { RateLimitManager } from "./RateLimitManager";
 import type {
   IExchangeClient,
   ExchangeConfig,
@@ -51,19 +52,16 @@ export class GateExchangeClient implements IExchangeClient {
 
   // ============ 数据缓存机制 ============
   private positionsCache: { data: PositionInfo[]; timestamp: number } | null = null;
-  private readonly POSITIONS_CACHE_TTL = 3000; // 持仓缓存3秒
+  private readonly POSITIONS_CACHE_TTL = 30000; // 持仓缓存30秒 (持仓变化不频繁，延长缓存减少API调用)
   private accountInfoCache: { data: AccountInfo; timestamp: number } | null = null;
-  private readonly ACCOUNT_INFO_CACHE_TTL = 5000; // 账户信息缓存5秒
+  private readonly ACCOUNT_INFO_CACHE_TTL = 30000; // 账户信息缓存30秒 (余额变化不频繁，延长缓存减少API调用)
   private tickerCache: Map<string, { data: TickerInfo; timestamp: number }> = new Map();
-  private readonly TICKER_CACHE_TTL = 10000; // 行情缓存10秒 (从2秒增加)
+  private readonly TICKER_CACHE_TTL = 60000; // 行情缓存60秒 (1分钟内价格变化不大，延长缓存大幅减少API调用)
   private candleCache: Map<string, { data: CandleData[]; timestamp: number }> = new Map();
-  private readonly CANDLE_CACHE_TTL = 300000; // K线缓存5分钟 (从30秒大幅增加)
+  private readonly CANDLE_CACHE_TTL = 600000; // K线缓存10分钟 (K线历史数据变化慢，延长缓存减少API调用)
 
-  // ============ 熔断器机制 ============
-  private consecutiveFailures = 0;
-  private readonly MAX_CONSECUTIVE_FAILURES = 3; // 连续失败3次触发熔断
-  private circuitBreakerOpenUntil = 0;
-  private readonly CIRCUIT_BREAKER_TIMEOUT = 60000; // 熔断器打开60秒后尝试恢复
+  // ============ 统一限流管理器 ============
+  private readonly rateLimitManager: RateLimitManager;
 
   constructor(config: ExchangeConfig) {
     this.config = config;
@@ -90,6 +88,15 @@ export class GateExchangeClient implements IExchangeClient {
     this.futuresApi = new GateApi.FuturesApi(this.client);
     // @ts-ignore
     this.spotApi = new GateApi.SpotApi(this.client);
+
+    // 初始化统一限流管理器
+    this.rateLimitManager = RateLimitManager.getInstance({
+      exchangeName: 'gate',
+      maxRequestsPerMinute: 600, // Gate.io限制较低，设置600保留安全余量
+      minRequestDelay: 150, // 最小请求间隔150ms
+      circuitBreakerThreshold: 3, // 连续失败3次触发熔断
+      circuitBreakerTimeout: 60000, // 熔断器打开60秒
+    });
 
     logger.info("Gate.io API 客户端初始化完成");
   }
@@ -132,48 +139,36 @@ export class GateExchangeClient implements IExchangeClient {
   }
 
   /**
-   * 检查熔断器状态
+   * 检查熔断器状态 (委托给统一限流管理器)
    */
   private isCircuitBreakerOpen(): boolean {
-    const now = Date.now();
-    if (this.circuitBreakerOpenUntil > now) {
-      return true;
-    }
-    // 熔断器超时后重置
-    if (this.circuitBreakerOpenUntil > 0 && this.circuitBreakerOpenUntil <= now) {
-      logger.info('🔄 熔断器恢复，尝试重新连接...');
-      this.consecutiveFailures = 0;
-      this.circuitBreakerOpenUntil = 0;
-    }
-    return false;
+    const stats = this.rateLimitManager.getStats();
+    return stats.isCircuitBreakerOpen || stats.bannedUntil > Date.now() || stats.backoffUntil > Date.now();
   }
 
   /**
-   * 记录请求成功
+   * 记录请求成功 (委托给统一限流管理器)
    */
   private recordSuccess(): void {
-    if (this.consecutiveFailures > 0) {
-      logger.info(`✅ API请求恢复正常，清除 ${this.consecutiveFailures} 次失败记录`);
-      this.consecutiveFailures = 0;
-    }
+    this.rateLimitManager.recordSuccess();
   }
 
   /**
-   * 记录请求失败
+   * 记录请求失败 (委托给统一限流管理器)
    */
   private recordFailure(): void {
-    this.consecutiveFailures++;
-    if (this.consecutiveFailures >= this.MAX_CONSECUTIVE_FAILURES) {
-      this.circuitBreakerOpenUntil = Date.now() + this.CIRCUIT_BREAKER_TIMEOUT;
-      logger.error(`🚨 连续失败 ${this.consecutiveFailures} 次，触发熔断器，${this.CIRCUIT_BREAKER_TIMEOUT / 1000}秒内将使用缓存数据`);
-    }
+    this.rateLimitManager.recordFailure();
   }
 
-  async getFuturesTicker(contract: string, retries: number = 2): Promise<TickerInfo> {
-    // 检查缓存
+  async getFuturesTicker(contract: string, retries: number = 2, cacheOptions?: { ttl?: number; skipCache?: boolean }, includeMarkPrice: boolean = false): Promise<TickerInfo> {
+    // 确定缓存TTL：优先使用传入的TTL，否则使用默认值
+    const cacheTTL = cacheOptions?.ttl !== undefined ? cacheOptions.ttl : this.TICKER_CACHE_TTL;
+    const skipCache = cacheOptions?.skipCache || false;
+
+    // 检查缓存（如果未设置skipCache）- Gate.io总是返回markPrice，无需区分缓存
     const cacheKey = contract;
     const cached = this.tickerCache.get(cacheKey);
-    if (cached && this.isCacheValid(cached.timestamp, this.TICKER_CACHE_TTL)) {
+    if (!skipCache && cached && this.isCacheValid(cached.timestamp, cacheTTL)) {
       return cached.data;
     }
 
@@ -245,12 +240,17 @@ export class GateExchangeClient implements IExchangeClient {
     contract: string,
     interval: string = "5m",
     limit: number = 100,
-    retries: number = 2
+    retries: number = 2,
+    cacheOptions?: { ttl?: number; skipCache?: boolean }
   ): Promise<CandleData[]> {
-    // 检查缓存
+    // 确定缓存TTL：优先使用传入的TTL，否则使用默认值
+    const cacheTTL = cacheOptions?.ttl !== undefined ? cacheOptions.ttl : this.CANDLE_CACHE_TTL;
+    const skipCache = cacheOptions?.skipCache || false;
+
+    // 检查缓存（如果未设置skipCache）
     const cacheKey = `${contract}-${interval}-${limit}`;
     const cached = this.candleCache.get(cacheKey);
-    if (cached && this.isCacheValid(cached.timestamp, this.CANDLE_CACHE_TTL)) {
+    if (!skipCache && cached && this.isCacheValid(cached.timestamp, cacheTTL)) {
       return cached.data;
     }
 
@@ -1111,7 +1111,7 @@ export class GateExchangeClient implements IExchangeClient {
         let stopLossOrder: any = null;
         
         try {
-          // 获取当前价格用于验证
+          // 获取当前价格用于验证（Gate.io总是返回markPrice，无需额外参数）
           const ticker = await this.getFuturesTicker(contract);
           currentPrice = parseFloat(ticker.markPrice || ticker.last || "0");
           
@@ -1535,5 +1535,19 @@ export class GateExchangeClient implements IExchangeClient {
     );
     
     return result.body || [];
+  }
+
+  /**
+   * 获取熔断器状态（Gate.io 默认无熔断器，始终返回false）
+   */
+  getCircuitBreakerStatus(): {
+    isOpen: boolean;
+    reason?: string;
+    remainingSeconds?: number;
+  } {
+    // Gate.io 客户端默认没有熔断器机制
+    return {
+      isOpen: false
+    };
   }
 }

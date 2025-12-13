@@ -52,7 +52,10 @@ ${params.scientificStopLoss?.enabled ? `▸科学止损(交易所服务器端):�
   ▸必须先analyze_opening_opportunities()获评分(工具自动:识别市场+选策略+量化评分+过滤已持+返前3个)
   ▸≥${minScore}分可考虑|${Math.floor(minScore*0.75)}-${minScore-1}分观望|<${Math.floor(minScore*0.75)}分禁止
   ▸⚠️禁止跳过evaluate|忽略评分|全<${minScore}分强行开
-  ▸checkOpenPosition()验(止损合理+无反向+资金足)→openPosition()执(自动设${params.scientificStopLoss?.enabled?'科学':'策略'}止损+${params.partialTakeProfit.extremeTakeProfit?.rMultiple||5}R极端止盈)
+  ${params.scientificStopLoss?.enabled 
+    ? `▸checkOpenPosition()验(必须):检查止损${params.scientificStopLoss.minDistance}-${params.scientificStopLoss.maxDistance}%范围+质量评分≥${RISK_PARAMS.MIN_STOP_LOSS_QUALITY_SCORE}+波动率非极端,shouldOpen=false立即放弃`
+    : `▸checkOpenPosition()验(必须):检查止损合理性+无反向仓+资金充足,shouldOpen=false立即放弃`}
+  ▸openPosition()执(自动设${params.scientificStopLoss?.enabled?'科学':'策略'}止损+${params.partialTakeProfit.extremeTakeProfit?.rMultiple||5}R极端止盈)
   ▸AI保留决策权(评分合格前提)
 
 【账户】
@@ -61,7 +64,7 @@ ${formatUSDT(accountInfo.totalBalance)}|可用${formatUSDT(accountInfo.available
   
   // 持仓(紧凑)
   if (positions.length > 0) {
-    prompt += `\n【持仓${positions.length}/${RISK_PARAMS.MAX_POSITIONS}】格式:币种 方向杠杆|盈亏%|持仓h|分批阶段(S1=已平33%,S2=已平66%,S3=全平)|预警\n`;
+    prompt += `\n【持仓${positions.length}/${RISK_PARAMS.MAX_POSITIONS}】格式:币种 方向杠杆|盈亏%|持仓h|止损单|分批阶段|预警\n`;
     
     const posSymbols = positions.map(p => p.symbol);
     let states: Map<string, MarketStateAnalysis> = new Map();
@@ -83,6 +86,10 @@ ${formatUSDT(accountInfo.totalBalance)}|可用${formatUSDT(accountInfo.available
       if (m.reversalWarning === 1 && w >= 70) f = '⚠️紧急';
       else if (w >= 50) f = '⚠️预';
       
+      // 🔧 止损单状态标记（让AI知道止损保护已启用）
+      const hasStopLoss = p.stop_loss && parseFloat(p.stop_loss) > 0;
+      const stopLossStatus = hasStopLoss ? '✓止损' : '❌无止损';
+      
       // 🔧 关键修复: 包含分批止盈进度（与完整版一致，添加百分比信息）
       const partialClosed = p.partial_close_percentage || 0;
       let stageInfo = '';
@@ -90,7 +97,7 @@ ${formatUSDT(accountInfo.totalBalance)}|可用${formatUSDT(accountInfo.available
       else if (partialClosed >= 33) stageInfo = '|S2(已平33%)';
       else if (partialClosed > 0) stageInfo = '|S1(已平部分)';
       
-      prompt += `${p.symbol} ${p.side}${p.leverage}x|${pnl>=0?'+':''}${formatPercent(pnl)}%|${h}h`;
+      prompt += `${p.symbol} ${p.side}${p.leverage}x|${pnl>=0?'+':''}${formatPercent(pnl)}%|${h}h|${stopLossStatus}`;
       if (stageInfo) prompt += stageInfo;
       if (f) prompt += `|${f}`;
       

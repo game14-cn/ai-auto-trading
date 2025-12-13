@@ -22,6 +22,7 @@
 import * as crypto from 'crypto';
 import { createLogger } from "../utils/logger";
 import { RISK_PARAMS } from "../config/riskParams";
+import { RateLimitManager } from "./RateLimitManager";
 import type {
   IExchangeClient,
   ExchangeConfig,
@@ -57,29 +58,25 @@ export class BinanceExchangeClient implements IExchangeClient {
 
   // ============ 数据缓存机制 ============
   private positionsCache: { data: PositionInfo[]; timestamp: number } | null = null;
-  private readonly POSITIONS_CACHE_TTL = 3000; // 持仓缓存3秒
+  private readonly POSITIONS_CACHE_TTL = 30000; // 持仓缓存30秒 (持仓变化不频繁，延长缓存减少API调用)
   private accountInfoCache: { data: AccountInfo; timestamp: number } | null = null;
-  private readonly ACCOUNT_INFO_CACHE_TTL = 5000; // 账户信息缓存5秒
+  private readonly ACCOUNT_INFO_CACHE_TTL = 30000; // 账户信息缓存30秒 (余额变化不频繁，延长缓存减少API调用)
   private tickerCache: Map<string, { data: TickerInfo; timestamp: number }> = new Map();
-  private readonly TICKER_CACHE_TTL = 10000; // 行情缓存10秒 (从2秒增加)
+  private readonly TICKER_CACHE_TTL = 60000; // 行情缓存60秒 (1分钟内价格变化不大，延长缓存大幅减少API调用)
   private candleCache: Map<string, { data: CandleData[]; timestamp: number }> = new Map();
-  private readonly CANDLE_CACHE_TTL = 300000; // K线缓存5分钟 (从30秒大幅增加)
+  private readonly CANDLE_CACHE_TTL = 600000; // K线缓存10分钟 (K线历史数据变化慢，延长缓存减少API调用)
   
-  // ============ 请求限流机制 ============
-  private requestTimestamps: number[] = [];
-  private readonly MAX_REQUESTS_PER_MINUTE = 5500; // 币安限制6000，保留安全边界
-  private readonly REQUEST_INTERVAL = 60000; // 1分钟窗口
-  private readonly MIN_REQUEST_DELAY = 100; // 最小请求间隔100ms
-  private lastRequestTime = 0;
+  // ============ 统一限流管理器 ============
+  private readonly rateLimitManager: RateLimitManager;
+  
+  // ============ 批量请求跟踪 ============
+  private recentCandleRequests: number[] = []; // 最近的K线请求时间戳
+  private recentTickerRequests: number[] = []; // 最近的ticker请求时间戳
+  private readonly BATCH_REQUEST_WINDOW = 5000; // 5秒内的请求算作批量请求
 
-  // ============ 熔断器机制 ============
-  private consecutiveFailures = 0;
-  private readonly MAX_CONSECUTIVE_FAILURES = 3; // 连续失败3次触发熔断
-  private circuitBreakerOpenUntil = 0;
-  private readonly CIRCUIT_BREAKER_TIMEOUT = 60000; // 熔断器打开60秒后尝试恢复
-  
-  // ============ IP封禁感知 ============
-  private ipBannedUntil = 0; // IP被封禁的截止时间
+  // ============ 资金费率缓存 ============
+  private fundingRateCache = new Map<string, { data: any; timestamp: number }>();
+  private readonly FUNDING_RATE_CACHE_TTL = 3600000; // 1小时缓存（资金费率8小时更新一次）
 
   constructor(config: ExchangeConfig) {
     this.config = config;
@@ -96,6 +93,15 @@ export class BinanceExchangeClient implements IExchangeClient {
     this.baseUrl = config.isTestnet 
       ? testnetUrls[0]  // 默认使用第一个
       : 'https://fapi.binance.com';
+
+    // 初始化统一限流管理器
+    this.rateLimitManager = RateLimitManager.getInstance({
+      exchangeName: 'binance',
+      maxRequestsPerMinute: 800, // 币安限制1200/分钟,设置800保留安全余量
+      minRequestDelay: 200, // 最小请求间隔200ms
+      circuitBreakerThreshold: 3, // 连续失败3次触发熔断
+      circuitBreakerTimeout: 60000, // 熔断器打开60秒
+    });
 
     if (config.isTestnet) {
       logger.info('使用 Binance U本位合约测试网');
@@ -171,12 +177,13 @@ export class BinanceExchangeClient implements IExchangeClient {
   }
 
   /**
-   * 同步服务器时间
+   * 同步服务器时间 - 不受熔断器影响的关键操作
    */
   private async syncServerTime(): Promise<void> {
     try {
       const t0 = Date.now();
-      const response = await this.publicRequest('/fapi/v1/time');
+      // 直接请求，不经过熔断器检查（时间同步是恢复的前提）
+      const response = await this.publicRequestWithoutCircuitBreaker('/fapi/v1/time');
       const t1 = Date.now();
       const serverTime = response.serverTime;
       
@@ -257,96 +264,25 @@ export class BinanceExchangeClient implements IExchangeClient {
   }
 
   /**
-   * 检查熔断器状态
+   * 检查熔断器状态 (委托给统一限流管理器)
    */
   private isCircuitBreakerOpen(): boolean {
-    const now = Date.now();
-    
-    // 检查IP封禁状态
-    if (this.ipBannedUntil > now) {
-      const remainingSeconds = Math.ceil((this.ipBannedUntil - now) / 1000);
-      if (remainingSeconds % 10 === 0) { // 每10秒提示一次
-        logger.warn(`⏰ IP仍被封禁，剩余 ${remainingSeconds} 秒，使用缓存数据`);
-      }
-      return true;
-    }
-    
-    // IP封禁结束，清除状态
-    if (this.ipBannedUntil > 0 && this.ipBannedUntil <= now) {
-      logger.info('✅ IP封禁已解除，恢复API请求');
-      this.ipBannedUntil = 0;
-      this.consecutiveFailures = 0;
-      this.circuitBreakerOpenUntil = 0;
-      return false;
-    }
-    
-    // 检查普通熔断器
-    if (this.circuitBreakerOpenUntil > now) {
-      return true;
-    }
-    
-    // 熔断器超时后重置
-    if (this.circuitBreakerOpenUntil > 0 && this.circuitBreakerOpenUntil <= now) {
-      logger.info('🔄 熔断器恢复，尝试重新连接...');
-      this.consecutiveFailures = 0;
-      this.circuitBreakerOpenUntil = 0;
-    }
-    
-    return false;
+    const stats = this.rateLimitManager.getStats();
+    return stats.isCircuitBreakerOpen || stats.bannedUntil > Date.now() || stats.backoffUntil > Date.now();
   }
 
   /**
-   * 记录请求成功
+   * 记录请求成功 (委托给统一限流管理器)
    */
   private recordSuccess(): void {
-    if (this.consecutiveFailures > 0) {
-      logger.info(`✅ API请求恢复正常，清除 ${this.consecutiveFailures} 次失败记录`);
-      this.consecutiveFailures = 0;
-    }
+    this.rateLimitManager.recordSuccess();
   }
 
   /**
-   * 记录请求失败
+   * 记录请求失败 (委托给统一限流管理器)
    */
   private recordFailure(): void {
-    this.consecutiveFailures++;
-    if (this.consecutiveFailures >= this.MAX_CONSECUTIVE_FAILURES) {
-      this.circuitBreakerOpenUntil = Date.now() + this.CIRCUIT_BREAKER_TIMEOUT;
-      logger.error(`🚨 连续失败 ${this.consecutiveFailures} 次，触发熔断器，${this.CIRCUIT_BREAKER_TIMEOUT / 1000}秒内将使用缓存数据`);
-    }
-  }
-
-  /**
-   * 请求限流控制
-   * 确保请求频率不超过币安限制
-   */
-  private async rateLimitControl(): Promise<void> {
-    const now = Date.now();
-    
-    // 清理1分钟前的时间戳
-    this.requestTimestamps = this.requestTimestamps.filter(
-      timestamp => now - timestamp < this.REQUEST_INTERVAL
-    );
-    
-    // 如果达到限制，等待
-    if (this.requestTimestamps.length >= this.MAX_REQUESTS_PER_MINUTE) {
-      const oldestTimestamp = this.requestTimestamps[0];
-      const waitTime = this.REQUEST_INTERVAL - (now - oldestTimestamp) + 100; // 额外等待100ms
-      if (waitTime > 0) {
-        logger.warn(`请求频率达到限制，等待 ${waitTime}ms`);
-        await new Promise(resolve => setTimeout(resolve, waitTime));
-      }
-    }
-    
-    // 确保最小请求间隔
-    const timeSinceLastRequest = now - this.lastRequestTime;
-    if (timeSinceLastRequest < this.MIN_REQUEST_DELAY) {
-      await new Promise(resolve => setTimeout(resolve, this.MIN_REQUEST_DELAY - timeSinceLastRequest));
-    }
-    
-    // 记录本次请求
-    this.requestTimestamps.push(Date.now());
-    this.lastRequestTime = Date.now();
+    this.rateLimitManager.recordFailure();
   }
 
   /**
@@ -358,15 +294,16 @@ export class BinanceExchangeClient implements IExchangeClient {
 
   /**
    * 处理API请求，包含重试、超时和错误处理逻辑
+   * 集成统一限流管理器，支持429/418检测和全局退避
    */
-  private async handleRequest(url: URL, options: RequestInit, retries = 3): Promise<any> {
-    // 检查熔断器状态
-    if (this.isCircuitBreakerOpen()) {
-      throw new Error('熔断器已打开，暂停API请求');
+  private async handleRequest(url: URL, options: RequestInit, retries = 3, endpoint: string = 'unknown'): Promise<any> {
+    // 应用统一限流控制（包括熔断器检查）
+    try {
+      await this.rateLimitManager.waitForRateLimit(endpoint);
+    } catch (error: any) {
+      // 如果限流管理器拒绝请求（熔断器打开、IP封禁、429退避），抛出错误让缓存降级处理
+      throw new Error(error.message);
     }
-
-    // 应用限流控制
-    await this.rateLimitControl();
     
     for (let attempt = 1; attempt <= retries; attempt++) {
       const controller = new AbortController();
@@ -413,31 +350,37 @@ export class BinanceExchangeClient implements IExchangeClient {
           
           const error = await response.json();
           
-          // 🔥 特殊处理: IP被封禁 (-1003)
-          if (error.code === -1003) {
-            // 解析封禁时间
-            const banMessage = error.msg || '';
-            const banMatch = banMessage.match(/banned until (\d+)/);
-            if (banMatch) {
-              const banUntilTimestamp = parseInt(banMatch[1]);
-              this.ipBannedUntil = banUntilTimestamp;
-              const banDuration = Math.ceil((banUntilTimestamp - Date.now()) / 1000);
-              
-              logger.error(`🚨 IP被Binance封禁，封禁时长: ${banDuration}秒`);
-              logger.error(`💡 建议: 使用WebSocket或大幅减少API调用频率`);
-              logger.error(`⏰ 系统将在封禁期间使用缓存数据`);
-              
-              // 立即触发熔断器，使用封禁时长
-              this.circuitBreakerOpenUntil = banUntilTimestamp;
-              this.consecutiveFailures = this.MAX_CONSECUTIVE_FAILURES;
-            } else {
-              // 没有封禁时间，使用默认熔断时长
-              logger.error(`🚨 IP被Binance封禁（-1003），触发熔断器`);
-              this.circuitBreakerOpenUntil = Date.now() + this.CIRCUIT_BREAKER_TIMEOUT;
-              this.consecutiveFailures = this.MAX_CONSECUTIVE_FAILURES;
+          // 🔥 特殊处理: 429警告 - 立即全局退避
+          if (response.status === 429 || error.code === -1003) {
+            if (response.status === 429) {
+              // 收到429立即触发全局退避
+              this.rateLimitManager.handle429Warning();
+              throw new Error('收到429警告，已触发全局退避');
             }
             
-            throw new Error(`IP被封禁: ${error.msg}`);
+            // � 418 IP封禁处理
+            if (error.code === -1003) {
+              const banMessage = error.msg || '';
+              const banMatch = banMessage.match(/banned until (\d+)/);
+              let banDuration = 300; // 默认5分钟
+              
+              if (banMatch) {
+                const banUntilTimestamp = parseInt(banMatch[1]);
+                banDuration = Math.ceil((banUntilTimestamp - Date.now()) / 1000);
+              }
+              
+              // 委托给统一限流管理器处理
+              this.rateLimitManager.handle418Ban(banDuration);
+              
+              logger.error(`💡 紧急建议（立即实施）：`);
+              logger.error(`   1. 检查 .env 配置，减少监控币种数量 (TRADING_SYMBOLS)`);
+              logger.error(`   2. 延长交易周期 (TRADING_INTERVAL_MINUTES=20)`);
+              logger.error(`   3. 延长条件单监控间隔 (PRICE_ORDER_CHECK_INTERVAL=90)`);
+              logger.error(`   4. 延长健康检查间隔 (HEALTH_CHECK_INTERVAL_MINUTES=10)`);
+              logger.error(`📚 详细优化方案请查看: docs/币安IP封禁-诊断与解决方案.md`);
+              
+              throw new Error(`IP被封禁: ${error.msg}`);
+            }
           }
           
           // 如果是时间戳错误 (-1021)，重新同步时间并重试
@@ -556,13 +499,80 @@ export class BinanceExchangeClient implements IExchangeClient {
       headers: {
         'User-Agent': 'Mozilla/5.0 AI-Auto-Trading Bot',
       }
-    }, retries);
+    }, retries, endpoint);
+  }
+
+  /**
+   * 发送公共请求（不受熔断器影响）- 用于时间同步等关键操作
+   */
+  private async publicRequestWithoutCircuitBreaker(endpoint: string, params: any = {}, retries = 2): Promise<any> {
+    const url = new URL(this.baseUrl + endpoint);
+    Object.keys(params).forEach(key => url.searchParams.append(key, params[key]));
+
+    // 时间同步请求不受限流限制（但会更新限流统计）
+    try {
+      await this.rateLimitManager.waitForRateLimit(endpoint);
+    } catch {
+      // 时间同步即使在熔断器打开时也需要执行
+    }
+    
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      const controller = new AbortController();
+      const timeoutMs = 10000;
+      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+      try {
+        const options: RequestInit = {
+          signal: controller.signal,
+          method: 'GET',
+          headers: {
+            'User-Agent': 'Mozilla/5.0 AI-Auto-Trading Bot',
+          }
+        };
+
+        const response = await fetch(url, options);
+        clearTimeout(timeoutId);
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          let errorData;
+          try {
+            errorData = JSON.parse(errorText);
+          } catch {
+            throw new Error(`HTTP ${response.status}: ${errorText}`);
+          }
+          throw new Error(errorData.msg || `HTTP ${response.status}`);
+        }
+
+        const data = await response.json();
+        return data;
+      } catch (error: any) {
+        clearTimeout(timeoutId);
+        
+        if (attempt < retries) {
+          const delay = 1000 * attempt;
+          await new Promise(resolve => setTimeout(resolve, delay));
+          continue;
+        }
+        
+        throw error;
+      }
+    }
+
+    throw new Error(`时间同步失败，已重试${retries}次`);
   }
 
   /**
    * 发送私有请求（需要签名）
    */
   private async privateRequest(endpoint: string, params: any = {}, method = 'GET', retries = 3): Promise<any> {
+    // 应用统一限流控制
+    try {
+      await this.rateLimitManager.waitForRateLimit(endpoint);
+    } catch (error: any) {
+      throw new Error(error.message);
+    }
+    
     // 确保时间已同步
     await this.ensureTimeSynced();
     
@@ -637,27 +647,21 @@ export class BinanceExchangeClient implements IExchangeClient {
             
             const error = await response.json();
             
-            // 🔥 特殊处理: IP被封禁 (-1003)
-            if (error.code === -1003) {
-              const banMessage = error.msg || '';
-              const banMatch = banMessage.match(/banned until (\d+)/);
-              if (banMatch) {
-                const banUntilTimestamp = parseInt(banMatch[1]);
-                this.ipBannedUntil = banUntilTimestamp;
-                const banDuration = Math.ceil((banUntilTimestamp - Date.now()) / 1000);
-                
-                if (attempt === retries) {
-                  logger.error(`🚨 IP被Binance封禁，封禁时长: ${banDuration}秒`);
-                }
-                
-                this.circuitBreakerOpenUntil = banUntilTimestamp;
-                this.consecutiveFailures = this.MAX_CONSECUTIVE_FAILURES;
-              } else {
-                this.circuitBreakerOpenUntil = Date.now() + this.CIRCUIT_BREAKER_TIMEOUT;
-                this.consecutiveFailures = this.MAX_CONSECUTIVE_FAILURES;
+            // 🔥 特殊处理: 429/418
+            if (response.status === 429 || error.code === -1003) {
+              if (response.status === 429) {
+                this.rateLimitManager.handle429Warning();
+                throw new Error('收到429警告，已触发全局退避');
               }
               
-              throw new Error(`IP被封禁: ${error.msg}`);
+              if (error.code === -1003) {
+                const banMessage = error.msg || '';
+                const banMatch = banMessage.match(/banned until (\d+)/);
+                const banDuration = banMatch ? Math.ceil((parseInt(banMatch[1]) - Date.now()) / 1000) : 300;
+                
+                this.rateLimitManager.handle418Ban(banDuration);
+                throw new Error(`IP被封禁: ${error.msg}`);
+              }
             }
             
             // 如果是时间戳错误 (-1021)，重新同步时间并重试
@@ -738,14 +742,18 @@ export class BinanceExchangeClient implements IExchangeClient {
     throw new Error(`API请求失败，已重试${retries}次`);
   }
 
-  async getFuturesTicker(contract: string, retries: number = 2): Promise<TickerInfo> {
+  async getFuturesTicker(contract: string, retries: number = 2, cacheOptions?: { ttl?: number; skipCache?: boolean }, includeMarkPrice: boolean = false): Promise<TickerInfo> {
     try {
       const symbol = this.normalizeContract(contract);
 
-      // 检查缓存
-      const cacheKey = symbol;
+      // 确定缓存TTL：优先使用传入的TTL，否则使用默认值
+      const cacheTTL = cacheOptions?.ttl !== undefined ? cacheOptions.ttl : this.TICKER_CACHE_TTL;
+      const skipCache = cacheOptions?.skipCache || false;
+
+      // 检查缓存（如果未设置skipCache）- 区分是否包含markPrice的缓存
+      const cacheKey = includeMarkPrice ? `${symbol}_full` : symbol;
       const cached = this.tickerCache.get(cacheKey);
-      if (cached && this.isCacheValid(cached.timestamp, this.TICKER_CACHE_TTL)) {
+      if (!skipCache && cached && this.isCacheValid(cached.timestamp, cacheTTL)) {
         return cached.data;
       }
 
@@ -758,21 +766,36 @@ export class BinanceExchangeClient implements IExchangeClient {
         throw new Error('熔断器已打开且无可用缓存');
       }
 
-      const [ticker, markPrice] = await Promise.all([
-        this.publicRequest('/fapi/v1/ticker/24hr', { symbol }, retries),
-        this.publicRequest('/fapi/v1/premiumIndex', { symbol }, retries)
-      ]);
+      // 🔧 智能批量请求延迟：只在检测到批量请求时添加延迟
+      const now = Date.now();
+      this.recentTickerRequests = this.recentTickerRequests.filter(t => now - t < this.BATCH_REQUEST_WINDOW);
       
-      const result = {
+      // 如果5秒内有3个以上ticker请求，视为批量请求，添加小延迟
+      if (this.recentTickerRequests.length >= 2) {
+        const delay = 100 + this.recentTickerRequests.length * 50; // 100ms + 每个请求额外50ms
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+      
+      this.recentTickerRequests.push(now);
+
+      // 🔧 优化：仅在需要时查询 premiumIndex（减少30%的API调用）
+      const ticker = await this.publicRequest('/fapi/v1/ticker/24hr', { symbol }, retries);
+      
+      const result: any = {
         contract: contract,
         last: ticker.lastPrice,
-        markPrice: markPrice.markPrice,
-        indexPrice: markPrice.indexPrice,
         volume24h: ticker.volume,
         high24h: ticker.highPrice,
         low24h: ticker.lowPrice,
         change24h: ticker.priceChangePercent,
       };
+
+      // 只有明确需要时才查询标记价格（节省API请求）
+      if (includeMarkPrice) {
+        const markPrice = await this.publicRequest('/fapi/v1/premiumIndex', { symbol }, retries);
+        result.markPrice = markPrice.markPrice;
+        result.indexPrice = markPrice.indexPrice;
+      }
 
       // 更新缓存
       this.tickerCache.set(cacheKey, {
@@ -784,7 +807,8 @@ export class BinanceExchangeClient implements IExchangeClient {
     } catch (error) {
       // 如果出错且有缓存，使用缓存降级
       const symbol = this.normalizeContract(contract);
-      const cached = this.tickerCache.get(symbol);
+      const cacheKey = includeMarkPrice ? `${symbol}_full` : symbol;
+      const cached = this.tickerCache.get(cacheKey);
       if (cached) {
         const errorMsg = error instanceof Error ? error.message : String(error);
         logger.warn(`获取 ${symbol} 行情失败，使用缓存数据: ${errorMsg}`);
@@ -800,30 +824,50 @@ export class BinanceExchangeClient implements IExchangeClient {
     contract: string,
     interval: string = '1h',
     limit: number = 100,
-    from?: number,
-    to?: number,
-    retries: number = 2
+    retries: number = 2,
+    cacheOptions?: { ttl?: number; skipCache?: boolean }
   ): Promise<CandleData[]> {
     try {
       const symbol = this.normalizeContract(contract);
 
-      // 检查缓存 (如果没有指定时间范围，才使用缓存)
-      if (!from && !to) {
-        const cacheKey = `${symbol}-${interval}-${limit}`;
-        const cached = this.candleCache.get(cacheKey);
-        if (cached && this.isCacheValid(cached.timestamp, this.CANDLE_CACHE_TTL)) {
+      // 确定缓存TTL：优先使用传入的TTL，否则使用默认值
+      const cacheTTL = cacheOptions?.ttl !== undefined ? cacheOptions.ttl : this.CANDLE_CACHE_TTL;
+      const skipCache = cacheOptions?.skipCache || false;
+
+      // 检查缓存（如果未设置skipCache）
+      const cacheKey = `${symbol}-${interval}-${limit}`;
+      const cached = this.candleCache.get(cacheKey);
+      if (!skipCache && cached && this.isCacheValid(cached.timestamp, cacheTTL)) {
+        return cached.data;
+      }
+
+      // 🔧 如果熔断器打开，使用过期缓存（K线数据可容忍轻微延迟）
+      if (this.isCircuitBreakerOpen()) {
+        if (cached) {
+          const cacheAge = Math.floor((Date.now() - cached.timestamp) / 1000);
+          logger.warn(`熔断器已打开，使用 ${symbol} ${interval} K线缓存数据 (${cacheAge}秒前)`);
           return cached.data;
         }
+        throw new Error('熔断器已打开且无可用K线缓存');
       }
+
+      // 🔧 智能批量请求延迟：只在检测到批量请求时添加延迟
+      const now = Date.now();
+      this.recentCandleRequests = this.recentCandleRequests.filter(t => now - t < this.BATCH_REQUEST_WINDOW);
+      
+      // 如果5秒内有3个以上K线请求，视为批量请求，添加渐进延迟
+      if (this.recentCandleRequests.length >= 2) {
+        const delay = 200 + this.recentCandleRequests.length * 150; // 200ms + 每个请求额外150ms
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+      
+      this.recentCandleRequests.push(now);
 
       const params: any = {
         symbol,
         interval,
         limit
       };
-
-      if (from) params.startTime = from;
-      if (to) params.endTime = to;
 
       const response = await this.publicRequest('/fapi/v1/klines', params, retries);
 
@@ -836,14 +880,11 @@ export class BinanceExchangeClient implements IExchangeClient {
         volume: k[5].toString(),
       }));
 
-      // 更新缓存 (仅当没有指定时间范围时)
-      if (!from && !to) {
-        const cacheKey = `${symbol}-${interval}-${limit}`;
-        this.candleCache.set(cacheKey, {
-          data: result,
-          timestamp: Date.now()
-        });
-      }
+      // 更新缓存
+      this.candleCache.set(cacheKey, {
+        data: result,
+        timestamp: Date.now()
+      });
 
       return result;
     } catch (error) {
@@ -1426,12 +1467,30 @@ export class BinanceExchangeClient implements IExchangeClient {
   async getFundingRate(contract: string, retries: number = 2): Promise<any> {
     try {
       const symbol = this.normalizeContract(contract);
+      const cacheKey = `funding_${symbol}`;
+      const now = Date.now();
+      
+      // 🔧 检查缓存（新增）
+      const cached = this.fundingRateCache.get(cacheKey);
+      if (cached && (now - cached.timestamp < this.FUNDING_RATE_CACHE_TTL)) {
+        const cacheAgeSeconds = Math.floor((now - cached.timestamp) / 1000);
+        logger.debug(`💾 使用缓存的资金费率: ${symbol} (${cacheAgeSeconds}秒前)`);
+        return cached.data;
+      }
+      
+      // 查询API
       const response = await this.publicRequest('/fapi/v1/premiumIndex', { symbol }, retries);
       
-      return {
+      const result = {
         funding_rate: response.lastFundingRate,
         next_funding_time: response.nextFundingTime
       };
+      
+      // 🔧 更新缓存（新增）
+      this.fundingRateCache.set(cacheKey, { data: result, timestamp: now });
+      logger.debug(`✅ 资金费率已缓存: ${symbol}`);
+      
+      return result;
     } catch (error) {
       logger.error('获取资金费率失败:', error as Error);
       throw error;
@@ -1631,8 +1690,8 @@ export class BinanceExchangeClient implements IExchangeClient {
         let stopLossData: any = null;
         
         try {
-          // 获取当前价格用于验证
-          const ticker = await this.getFuturesTicker(contract);
+          // 获取当前价格用于验证（需要markPrice进行精确校验）
+          const ticker = await this.getFuturesTicker(contract, 2, undefined, true);
           currentPrice = parseFloat(ticker.markPrice || ticker.last || "0");
           
           if (currentPrice <= 0) {
@@ -1668,20 +1727,26 @@ export class BinanceExchangeClient implements IExchangeClient {
           }
           
           formattedStopLoss = await this.formatPriceByTickSize(contract, stopLoss);
+          
+          // 🔧 使用币安Algo Order API创建条件单
+          // 根据官方文档: https://developers.binance.com/docs/zh-CN/derivatives/usds-margined-futures/trade/rest-api/New-Algo-Order
           stopLossData = {
+            algoType: 'CONDITIONAL',      // 必须是 CONDITIONAL
             symbol,
-            side: posSize > 0 ? 'SELL' : 'BUY', // 平仓方向相反
-            type: 'STOP_MARKET',
-            stopPrice: formattedStopLoss,
-            closePosition: 'true', // 平掉整个仓位
-            workingType: 'MARK_PRICE', // 使用标记价格触发（避免插针）
-            priceProtect: 'TRUE' // 启用价格保护
+            side: posSize > 0 ? 'SELL' : 'BUY',
+            type: 'STOP_MARKET',          // 市价止损
+            quantity: Math.abs(posSize).toString(),
+            triggerPrice: formattedStopLoss,  // 使用 triggerPrice 而不是 stopPrice
+            workingType: 'MARK_PRICE',
+            priceProtect: 'true',
+            reduceOnly: 'true'
           };
 
-          const response = await this.privateRequest('/fapi/v1/order', stopLossData, 'POST', 2);
-          stopLossOrderId = response.orderId?.toString();
+          // 使用 Algo Order API 创建条件订单
+          const response = await this.privateRequest('/fapi/v1/algoOrder', stopLossData, 'POST', 2);
+          stopLossOrderId = response.algoId?.toString();  // 注意: Algo Order 返回 algoId
           
-          logger.info(`✅ ${contract} 止损单已创建: ID=${stopLossOrderId}, 触发价=${formattedStopLoss}, 当前价=${currentPrice.toFixed(6)}`);
+          logger.info(`✅ ${contract} 止损单已创建: algoId=${stopLossOrderId}, 触发价=${formattedStopLoss}, 当前价=${currentPrice.toFixed(6)}`);
         } catch (error: any) {
           const errorMsg = error.message || String(error);
           const errorCode = error.code;
@@ -1702,15 +1767,10 @@ export class BinanceExchangeClient implements IExchangeClient {
             logger.warn(`⚠️ 网络超时，等待3秒后重试...`);
             
             try {
-              // 等待3秒，给网络更多恢复时间
-              await new Promise(resolve => setTimeout(resolve, 3000));
+              const retryResponse = await this.privateRequest('/fapi/v1/algoOrder', stopLossData, 'POST', 2);
+              stopLossOrderId = retryResponse.algoId?.toString();
               
-              logger.info(`🔄 重试创建止损单 (网络超时): 触发价=${formattedStopLoss}`);
-              
-              const retryResponse = await this.privateRequest('/fapi/v1/order', stopLossData, 'POST', 2);
-              stopLossOrderId = retryResponse.orderId?.toString();
-              
-              logger.info(`✅ ${contract} 止损单创建成功(超时重试): ID=${stopLossOrderId}, 触发价=${formattedStopLoss}`);
+              logger.info(`✅ ${contract} 止损单创建成功(超时重试): algoId=${stopLossOrderId}, 触发价=${formattedStopLoss}`);
             } catch (retryError: any) {
               logger.error(`❌ 创建止损单重试仍然失败: ${retryError.message}`);
               
@@ -1738,8 +1798,8 @@ export class BinanceExchangeClient implements IExchangeClient {
         let takeProfitData: any = null;
         
         try {
-          // 获取当前价格用于验证
-          const ticker = await this.getFuturesTicker(contract);
+          // 获取当前价格用于验证（需要markPrice进行精确校验）
+          const ticker = await this.getFuturesTicker(contract, 2, undefined, true);
           currentPrice = parseFloat(ticker.markPrice || ticker.last || "0");
           
           if (currentPrice <= 0) {
@@ -1775,20 +1835,25 @@ export class BinanceExchangeClient implements IExchangeClient {
           }
           
           formattedTakeProfit = await this.formatPriceByTickSize(contract, takeProfit);
+          
+          // 🔧 使用币安Algo Order API创建条件单
           takeProfitData = {
+            algoType: 'CONDITIONAL',
             symbol,
-            side: posSize > 0 ? 'SELL' : 'BUY', // 平仓方向相反
+            side: posSize > 0 ? 'SELL' : 'BUY',
             type: 'TAKE_PROFIT_MARKET',
-            stopPrice: formattedTakeProfit,
-            closePosition: 'true', // 平掉整个仓位
-            workingType: 'MARK_PRICE', // 使用标记价格触发
-            priceProtect: 'TRUE' // 启用价格保护
+            quantity: Math.abs(posSize).toString(),
+            triggerPrice: formattedTakeProfit,  // 使用 triggerPrice
+            workingType: 'MARK_PRICE',
+            priceProtect: 'true',
+            reduceOnly: 'true'
           };
 
-          const response = await this.privateRequest('/fapi/v1/order', takeProfitData, 'POST', 2);
-          takeProfitOrderId = response.orderId?.toString();
+          // 使用 Algo Order API 创建条件订单
+          const response = await this.privateRequest('/fapi/v1/algoOrder', takeProfitData, 'POST', 2);
+          takeProfitOrderId = response.algoId?.toString();
           
-          logger.info(`✅ ${contract} 止盈单已创建: ID=${takeProfitOrderId}, 触发价=${formattedTakeProfit}, 当前价=${currentPrice.toFixed(6)}`);
+          logger.info(`✅ ${contract} 止盈单已创建: algoId=${takeProfitOrderId}, 触发价=${formattedTakeProfit}, 当前价=${currentPrice.toFixed(6)}`);
         } catch (error: any) {
           const errorMsg = error.message || String(error);
           const errorCode = error.code;
@@ -1814,10 +1879,10 @@ export class BinanceExchangeClient implements IExchangeClient {
               
               logger.info(`🔄 重试创建止盈单 (网络超时): 触发价=${formattedTakeProfit}`);
               
-              const retryResponse = await this.privateRequest('/fapi/v1/order', takeProfitData, 'POST', 2);
-              takeProfitOrderId = retryResponse.orderId?.toString();
+              const retryResponse = await this.privateRequest('/fapi/v1/algoOrder', takeProfitData, 'POST', 2);
+              takeProfitOrderId = retryResponse.algoId?.toString();
               
-              logger.info(`✅ ${contract} 止盈单创建成功(超时重试): ID=${takeProfitOrderId}, 触发价=${formattedTakeProfit}`);
+              logger.info(`✅ ${contract} 止盈单创建成功(超时重试): algoId=${takeProfitOrderId}, 触发价=${formattedTakeProfit}`);
             } catch (retryError: any) {
               logger.error(`❌ 创建止盈单重试仍然失败: ${retryError.message}`);
               // 如果止盈单失败但止损单成功，仍返回成功（止损更重要）
@@ -1878,45 +1943,41 @@ export class BinanceExchangeClient implements IExchangeClient {
     try {
       const symbol = this.normalizeContract(contract);
       
-      // 获取所有未成交订单
-      const response = await this.privateRequest('/fapi/v1/openOrders', { symbol }, 'GET', 2);
+      // 🔧 使用 Algo Order API 查询条件单
+      const response = await this.privateRequest('/fapi/v1/openAlgoOrders', { 
+        algoType: 'CONDITIONAL',
+        symbol 
+      }, 'GET', 2);
       const orders = response || [];
-      
-      // 筛选出止损止盈订单
-      const stopOrders = orders.filter((order: any) => 
-        order.type === 'STOP_MARKET' || 
-        order.type === 'TAKE_PROFIT_MARKET' ||
-        order.type === 'STOP' ||
-        order.type === 'TAKE_PROFIT'
-      );
 
-      if (stopOrders.length === 0) {
+      if (orders.length === 0) {
         return {
           success: true,
-          message: `${contract} 没有活跃的止损止盈订单`
+          message: `${contract} 没有活跃的条件单`
         };
       }
 
-      // 取消所有止损止盈订单
-      for (const order of stopOrders) {
+      // 取消所有条件单
+      for (const order of orders) {
         try {
-          await this.privateRequest('/fapi/v1/order', {
+          // 使用 Algo Order API 删除
+          await this.privateRequest('/fapi/v1/algoOrder', {
             symbol,
-            orderId: order.orderId
+            algoId: order.algoId
           }, 'DELETE', 2);
-          logger.info(`已取消订单: ${order.orderId} (${order.type})`);
+          logger.info(`已取消条件单: algoId=${order.algoId} (${order.orderType})`);
         } catch (error: any) {
-          logger.warn(`取消订单失败: ${order.orderId}, ${error.message}`);
+          logger.warn(`取消条件单失败: algoId=${order.algoId}, ${error.message}`);
         }
       }
       
-      logger.info(`✅ 已取消 ${contract} 的 ${stopOrders.length} 个止损止盈订单`);
+      logger.info(`✅ 已取消 ${contract} 的 ${orders.length} 个条件单`);
       return {
         success: true,
-        message: `已取消 ${contract} 的 ${stopOrders.length} 个止损止盈订单`
+        message: `已取消 ${contract} 的 ${orders.length} 个条件单`
       };
     } catch (error: any) {
-      logger.error(`取消止损止盈订单失败: ${error.message}`);
+      logger.error(`取消条件单失败: ${error.message}`);
       return {
         success: false,
         message: `取消失败: ${error.message}`
@@ -1934,34 +1995,37 @@ export class BinanceExchangeClient implements IExchangeClient {
     try {
       const symbol = this.normalizeContract(contract);
       
-      // 获取所有未成交订单
-      const response = await this.privateRequest('/fapi/v1/openOrders', { symbol }, 'GET', 2);
+      // 🔧 使用 Algo Order API 查询条件单
+      const response = await this.privateRequest('/fapi/v1/openAlgoOrders', { 
+        algoType: 'CONDITIONAL',
+        symbol 
+      }, 'GET', 2);
       const orders = response || [];
       
       let stopLossOrder: any;
       let takeProfitOrder: any;
 
       for (const order of orders) {
-        if (order.type === 'STOP_MARKET' || order.type === 'STOP') {
+        if (order.orderType === 'STOP_MARKET' || order.orderType === 'STOP') {
           stopLossOrder = {
-            id: order.orderId?.toString(),
+            id: order.algoId?.toString(),
             contract: contract,
-            type: order.type,
+            type: order.orderType,
             side: order.side,
-            stopPrice: order.stopPrice,
-            quantity: order.origQty,
-            status: order.status,
+            triggerPrice: order.triggerPrice,  // Algo Order 使用 triggerPrice
+            quantity: order.quantity,
+            status: order.algoStatus,
             workingType: order.workingType
           };
-        } else if (order.type === 'TAKE_PROFIT_MARKET' || order.type === 'TAKE_PROFIT') {
+        } else if (order.orderType === 'TAKE_PROFIT_MARKET' || order.orderType === 'TAKE_PROFIT') {
           takeProfitOrder = {
-            id: order.orderId?.toString(),
+            id: order.algoId?.toString(),
             contract: contract,
-            type: order.type,
+            type: order.orderType,
             side: order.side,
-            stopPrice: order.stopPrice,
-            quantity: order.origQty,
-            status: order.status,
+            triggerPrice: order.triggerPrice,
+            quantity: order.quantity,
+            status: order.algoStatus,
             workingType: order.workingType
           };
         }
@@ -1987,22 +2051,60 @@ export class BinanceExchangeClient implements IExchangeClient {
    * @param status 状态过滤（Binance不支持，忽略此参数）
    */
   async getPriceOrders(contract?: string, status?: string): Promise<any[]> {
-    const params: any = {};
+    const params: any = {
+      algoType: 'CONDITIONAL'  // 必须指定 algoType
+    };
+    
     if (contract) {
       params.symbol = this.normalizeContract(contract);
     }
     
-    // Binance获取所有未成交订单（包含条件单）
-    const response = await this.privateRequest('/fapi/v1/openOrders', params, 'GET', 2);
+    // 🔧 使用 Algo Order API 获取条件单
+    const response = await this.privateRequest('/fapi/v1/openAlgoOrders', params, 'GET', 2);
     
-    // 过滤出条件单（止损止盈订单）
-    const orders = (response || []).filter((order: any) => {
-      return order.type === 'STOP_MARKET' || 
-             order.type === 'STOP' || 
-             order.type === 'TAKE_PROFIT_MARKET' || 
-             order.type === 'TAKE_PROFIT';
-    });
+    return response || [];
+  }
+
+  /**
+   * 获取熔断器状态（检测是否因IP封禁使用缓存数据）- 委托给统一限流管理器
+   */
+  getCircuitBreakerStatus(): {
+    isOpen: boolean;
+    reason?: string;
+    remainingSeconds?: number;
+  } {
+    const stats = this.rateLimitManager.getStats();
+    const now = Date.now();
     
-    return orders;
+    // 检查IP封禁
+    if (stats.bannedUntil > now) {
+      return {
+        isOpen: true,
+        reason: 'IP封禁',
+        remainingSeconds: Math.ceil((stats.bannedUntil - now) / 1000)
+      };
+    }
+    
+    // 检查429全局退避
+    if (stats.backoffUntil > now) {
+      return {
+        isOpen: true,
+        reason: '429全局退避',
+        remainingSeconds: Math.ceil((stats.backoffUntil - now) / 1000)
+      };
+    }
+    
+    // 检查熔断器
+    if (stats.isCircuitBreakerOpen) {
+      return {
+        isOpen: true,
+        reason: 'API限流熔断',
+        remainingSeconds: 60 // 估计值
+      };
+    }
+    
+    return {
+      isOpen: false
+    };
   }
 }
